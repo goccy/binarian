@@ -6,15 +6,15 @@ import (
 	"debug/macho"
 	"encoding/binary"
 	"fmt"
-	"go/types"
 	"os"
 	"sort"
 	"sync"
 
 	internalreflect "github.com/goccy/binarian/internal/reflect"
 	"github.com/goccy/binarian/reflect"
-	binarytypes "github.com/goccy/binarian/types"
+	binaryssa "github.com/goccy/binarian/ssa"
 	"golang.org/x/arch/x86/x86asm"
+	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/ssa"
 )
 
@@ -22,7 +22,7 @@ type MachOFile struct {
 	File     *macho.File
 	rawFile  *os.File
 	allSyms  []Sym
-	typeMap  map[string]reflect.Type
+	allTypes []reflect.Type
 	funcMap  map[uintptr]*gosym.Func
 	loadOnce sync.Once
 }
@@ -120,15 +120,6 @@ func (f *MachOFile) load() error {
 		return err
 	}
 	f.allSyms = syms
-	typeMap := map[string]reflect.Type{}
-	allTypes, err := f.Types()
-	if err != nil {
-		return err
-	}
-	for _, typ := range allTypes {
-		typeMap[fmt.Sprintf("%s.%s", typ.PkgPath(), typ.Name())] = typ
-	}
-	f.typeMap = typeMap
 	funcMap := map[uintptr]*gosym.Func{}
 	symtab, err := f.gosymTable()
 	if err != nil {
@@ -139,7 +130,44 @@ func (f *MachOFile) load() error {
 		funcMap[uintptr(fn.Value)] = &fn
 	}
 	f.funcMap = funcMap
+	allTypes, err := f.Types()
+	if err != nil {
+		return err
+	}
+	f.allTypes = allTypes
 	return err
+}
+
+func (f *MachOFile) CallGraph() (*callgraph.Graph, error) {
+	funcs, err := f.Funcs()
+	if err != nil {
+		return nil, err
+	}
+	var mainFunc *ssa.Function
+	for _, fn := range funcs {
+		ssaFunc := fn.SSAFunc
+		pkgName := ssaFunc.Package().Pkg.Name()
+		if pkgName == "main" && ssaFunc.Name() == "main" {
+			mainFunc = ssaFunc
+			break
+		}
+	}
+	if mainFunc == nil {
+		return nil, fmt.Errorf("failed to find main function")
+	}
+	graph := callgraph.New(mainFunc)
+	for _, fn := range funcs {
+		ssaFunc := fn.SSAFunc
+		if ssaFunc.Package().String() == "main" && ssaFunc.Name() == "main" {
+			continue
+		}
+		node := graph.CreateNode(ssaFunc)
+		for _, callee := range fn.Callee {
+			calleeNode := graph.CreateNode(callee)
+			callgraph.AddEdge(node, nil, calleeNode)
+		}
+	}
+	return graph, nil
 }
 
 func (f *MachOFile) Funcs() ([]*Function, error) {
@@ -157,6 +185,7 @@ func (f *MachOFile) Funcs() ([]*Function, error) {
 	addr := f.File.Section("__text").Addr
 	textdat, _ := f.File.Section("__text").Data()
 	syms := f.allSyms
+	ssaBuilder := binaryssa.NewBuilder(f.allTypes)
 	lookup := func(addr uint64) (string, uint64) {
 		i := sort.Search(len(syms), func(i int) bool { return addr < syms[i].Addr })
 		if i > 0 {
@@ -189,7 +218,7 @@ func (f *MachOFile) Funcs() ([]*Function, error) {
 						addr := int64(pc) + int64(rel) + int64(inst.Len)
 						fun, found := f.funcMap[uintptr(addr)]
 						if found {
-							funcV.Callee = append(funcV.Callee, f.funcToSSAFunction(*fun))
+							funcV.Callee = append(funcV.Callee, ssaBuilder.BuildFunction(*fun))
 						}
 					}
 				}
@@ -200,52 +229,10 @@ func (f *MachOFile) Funcs() ([]*Function, error) {
 			pos += inst.Len
 			pc += uint64(inst.Len)
 		}
-		funcV.SSAFunc = f.funcToSSAFunction(fn)
+		funcV.SSAFunc = ssaBuilder.BuildFunction(fn)
 		funcs = append(funcs, funcV)
 	}
 	return funcs, nil
-}
-
-func (f *MachOFile) funcToSSAFunction(fn gosym.Func) (retfunc *ssa.Function) {
-	prog := &ssa.Program{}
-	base := fn.Sym.BaseName()
-	pkgName := fn.Sym.PackageName()
-	recvName := fn.Sym.ReceiverName()
-	pkg := prog.Package(types.NewPackage("", pkgName))
-	defer func() {
-		retfunc.Pkg = pkg
-	}()
-	if recvName != "" {
-		recvType, isPtr := recvType(recvName)
-		foundType, exists := f.typeMap[fmt.Sprintf("%s.%s", pkgName, recvType)]
-		if exists {
-			if isPtr {
-				foundType = internalreflect.PtrTo(foundType)
-			}
-			mtd, found := foundType.MethodByName(base)
-			if found && mtd.Type != nil {
-				sig := binarytypes.MethodSignatureFromReflectType(foundType, mtd)
-				return prog.NewFunction(base, sig, "")
-			}
-		}
-		return prog.NewFunction(base, types.NewSignature(nil, nil, nil, false), "")
-	}
-	return prog.NewFunction(base, types.NewSignature(nil, nil, nil, false), "")
-}
-
-func recvType(recvName string) (string, bool) {
-	if recvName == "" {
-		return "", false
-	}
-	if recvName[0] == '(' {
-		recvName = recvName[1 : len(recvName)-1]
-	}
-	isPtr := false
-	if recvName[0] == '*' {
-		recvName = recvName[1:]
-		isPtr = true
-	}
-	return recvName, isPtr
 }
 
 func (f *MachOFile) Types() ([]reflect.Type, error) {

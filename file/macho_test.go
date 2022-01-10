@@ -7,6 +7,7 @@ import (
 
 	"github.com/goccy/binarian/file"
 	"github.com/goccy/binarian/reflect"
+	"golang.org/x/tools/go/callgraph"
 )
 
 func TestMachOFile(t *testing.T) {
@@ -41,5 +42,16 @@ func TestMachOFile(t *testing.T) {
 	}
 	for _, fun := range funcs {
 		t.Log(fun.SSAFunc)
+	}
+
+	graph, err := machoFile.CallGraph()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := callgraph.GraphVisitEdges(graph, func(edge *callgraph.Edge) error {
+		t.Logf("%s => %s\n", edge.Caller, edge.Callee)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
